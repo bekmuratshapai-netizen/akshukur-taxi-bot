@@ -109,6 +109,7 @@ def init_db():
             sub_date TEXT NOT NULL,          -- дата подписки, формат YYYY-MM-DD
             amount INTEGER,
             receipt_photo_id TEXT,
+            receipt_type TEXT DEFAULT 'photo',  -- photo / document (pdf)
             status TEXT DEFAULT 'pending',   -- pending / confirmed / rejected
             admin_message_id INTEGER,
             created_at TEXT
@@ -145,12 +146,12 @@ def today_str():
     return date.today().isoformat()
 
 
-def create_subscription_request(driver_id, amount, receipt_photo_id):
+def create_subscription_request(driver_id, amount, receipt_file_id, receipt_type="photo"):
     conn = db()
     cur = conn.execute(
-        """INSERT INTO subscriptions (driver_id, sub_date, amount, receipt_photo_id, created_at)
-           VALUES (?, ?, ?, ?, ?)""",
-        (driver_id, today_str(), amount, receipt_photo_id, datetime.now().isoformat()),
+        """INSERT INTO subscriptions (driver_id, sub_date, amount, receipt_photo_id, receipt_type, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (driver_id, today_str(), amount, receipt_file_id, receipt_type, datetime.now().isoformat()),
     )
     conn.commit()
     sub_id = cur.lastrowid
@@ -709,20 +710,36 @@ async def start_subscription(message: Message, state: FSMContext):
     await message.answer(
         f"Ежедневная подписка: <b>{price} ₸</b>\n\n"
         f"{kaspi_line}\n\n"
-        f"Переведи сумму и пришли сюда скриншот чека (фото) — "
+        f"Переведи сумму и пришли сюда чек — можно скриншотом (фото) или PDF-файлом — "
         f"после подтверждения модератором сможешь принимать заказы сегодня.",
         reply_markup=ReplyKeyboardRemove(),
     )
 
 
 @router.message(SubscriptionForm.waiting_receipt, F.content_type == ContentType.PHOTO)
-async def subscription_receipt(message: Message, state: FSMContext):
+async def subscription_receipt_photo(message: Message, state: FSMContext):
+    file_id = message.photo[-1].file_id
+    await process_subscription_receipt(message, state, file_id, receipt_type="photo")
+
+
+@router.message(SubscriptionForm.waiting_receipt, F.content_type == ContentType.DOCUMENT)
+async def subscription_receipt_document(message: Message, state: FSMContext):
+    document = message.document
+    if document.mime_type != "application/pdf":
+        await message.answer(
+            "Файл принимается только в формате PDF или как фото. "
+            "Пришли скриншот чека или PDF-файл:"
+        )
+        return
+    await process_subscription_receipt(message, state, document.file_id, receipt_type="document")
+
+
+async def process_subscription_receipt(message: Message, state: FSMContext, file_id: str, receipt_type: str):
     driver_id = message.from_user.id
     driver_row = get_driver_by_telegram_id(driver_id)
     price = get_subscription_price()
-    file_id = message.photo[-1].file_id
 
-    sub_id = create_subscription_request(driver_id, price, file_id)
+    sub_id = create_subscription_request(driver_id, price, file_id, receipt_type)
     await state.clear()
 
     await message.answer(
@@ -738,18 +755,27 @@ async def subscription_receipt(message: Message, state: FSMContext):
         f"📅 Дата: {today_str()}\n"
         f"🔗 Telegram: {message.from_user.mention_html()}"
     )
-    sent = await bot.send_photo(
-        ADMIN_CHAT_ID,
-        file_id,
-        caption=caption,
-        reply_markup=subscription_moderation_kb(sub_id),
-    )
+
+    if receipt_type == "document":
+        sent = await bot.send_document(
+            ADMIN_CHAT_ID,
+            file_id,
+            caption=caption,
+            reply_markup=subscription_moderation_kb(sub_id),
+        )
+    else:
+        sent = await bot.send_photo(
+            ADMIN_CHAT_ID,
+            file_id,
+            caption=caption,
+            reply_markup=subscription_moderation_kb(sub_id),
+        )
     set_subscription_admin_message(sub_id, sent.message_id)
 
 
 @router.message(SubscriptionForm.waiting_receipt)
 async def subscription_receipt_wrong(message: Message):
-    await message.answer("Нужен именно скриншот чека (фото). Пришли фото подтверждения оплаты:")
+    await message.answer("Нужен чек — пришли скриншот (фото) или PDF-файл с подтверждением оплаты:")
 
 
 @router.callback_query(F.data.startswith("sub_ok:"))
