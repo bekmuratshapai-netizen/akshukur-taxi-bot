@@ -32,6 +32,13 @@ DRIVERS_GROUP_ID = int(os.getenv("DRIVERS_GROUP_ID", "0"))
 # Если не задан отдельно — используется тот же чат, что и DRIVERS_GROUP_ID.
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", str(DRIVERS_GROUP_ID)))
 MIN_DRIVER_AGE = int(os.getenv("MIN_DRIVER_AGE", "21"))
+# Telegram id людей, кому разрешено менять цену подписки (через запятую)
+ADMIN_USER_IDS = [
+    int(x) for x in os.getenv("ADMIN_USER_IDS", "").replace(" ", "").split(",") if x
+]
+DEFAULT_SUBSCRIPTION_PRICE = int(os.getenv("DEFAULT_SUBSCRIPTION_PRICE", "200"))
+KASPI_NUMBER = os.getenv("KASPI_NUMBER", "не указан — уточни у организатора")
+KASPI_NAME = os.getenv("KASPI_NAME", "")
 DB_PATH = os.path.join(os.path.dirname(__file__), "taxi.db")
 
 logging.basicConfig(level=logging.INFO)
@@ -86,8 +93,100 @@ def init_db():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            driver_id INTEGER NOT NULL,
+            sub_date TEXT NOT NULL,          -- дата подписки, формат YYYY-MM-DD
+            amount INTEGER,
+            receipt_photo_id TEXT,
+            status TEXT DEFAULT 'pending',   -- pending / confirmed / rejected
+            admin_message_id INTEGER,
+            created_at TEXT
+        )
+        """
+    )
     conn.commit()
     conn.close()
+
+
+def get_setting(key, default=None):
+    conn = db()
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    return row["value"] if row else default
+
+
+def set_setting(key, value):
+    conn = db()
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, str(value)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_subscription_price() -> int:
+    return int(get_setting("subscription_price", DEFAULT_SUBSCRIPTION_PRICE))
+
+
+def today_str():
+    return date.today().isoformat()
+
+
+def create_subscription_request(driver_id, amount, receipt_photo_id):
+    conn = db()
+    cur = conn.execute(
+        """INSERT INTO subscriptions (driver_id, sub_date, amount, receipt_photo_id, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (driver_id, today_str(), amount, receipt_photo_id, datetime.now().isoformat()),
+    )
+    conn.commit()
+    sub_id = cur.lastrowid
+    conn.close()
+    return sub_id
+
+
+def get_subscription(sub_id):
+    conn = db()
+    row = conn.execute("SELECT * FROM subscriptions WHERE id = ?", (sub_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def set_subscription_admin_message(sub_id, message_id):
+    conn = db()
+    conn.execute("UPDATE subscriptions SET admin_message_id=? WHERE id=?", (message_id, sub_id))
+    conn.commit()
+    conn.close()
+
+
+def set_subscription_status(sub_id, status):
+    conn = db()
+    conn.execute("UPDATE subscriptions SET status=? WHERE id=?", (status, sub_id))
+    conn.commit()
+    conn.close()
+
+
+def is_driver_online_today(driver_id) -> bool:
+    conn = db()
+    row = conn.execute(
+        "SELECT 1 FROM subscriptions WHERE driver_id=? AND sub_date=? AND status='confirmed'",
+        (driver_id, today_str()),
+    ).fetchone()
+    conn.close()
+    return bool(row)
 
 
 def create_driver_application(telegram_id, full_name, birth_year, phone, car_number,
@@ -221,6 +320,10 @@ class DriverForm(StatesGroup):
     confirm = State()
 
 
+class SubscriptionForm(StatesGroup):
+    waiting_receipt = State()
+
+
 # ---------- КЛАВИАТУРЫ ----------
 
 def main_menu_kb():
@@ -228,6 +331,7 @@ def main_menu_kb():
         keyboard=[
             [KeyboardButton(text="🚕 Заказать такси")],
             [KeyboardButton(text="🚗 Стать водителем")],
+            [KeyboardButton(text="🟢 Выйти на линию")],
         ],
         resize_keyboard=True,
     )
@@ -268,6 +372,15 @@ def driver_moderation_kb(driver_row_id: int):
         inline_keyboard=[[
             InlineKeyboardButton(text="✅ Одобрить", callback_data=f"drv_ok:{driver_row_id}"),
             InlineKeyboardButton(text="❌ Отклонить", callback_data=f"drv_no:{driver_row_id}"),
+        ]]
+    )
+
+
+def subscription_moderation_kb(sub_id: int):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Подтвердить оплату", callback_data=f"sub_ok:{sub_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"sub_no:{sub_id}"),
         ]]
     )
 
@@ -569,6 +682,153 @@ async def driver_reject_cb(callback: CallbackQuery):
         logging.warning(f"Не удалось уведомить водителя {driver_row['telegram_id']}: {e}")
 
 
+# ---------- ЕЖЕДНЕВНАЯ ПОДПИСКА "ВЫЙТИ НА ЛИНИЮ" ----------
+
+@router.message(F.text == "🟢 Выйти на линию")
+async def start_subscription(message: Message, state: FSMContext):
+    driver_id = message.from_user.id
+
+    if not is_driver_approved(driver_id):
+        await message.answer(
+            "Сначала пройди регистрацию водителя («🚗 Стать водителем») "
+            "и дождись одобрения модератором."
+        )
+        return
+
+    if is_driver_online_today(driver_id):
+        await message.answer("Ты уже на линии сегодня ✅ Заказы уже доступны в группе.")
+        return
+
+    price = get_subscription_price()
+    await state.set_state(SubscriptionForm.waiting_receipt)
+
+    kaspi_line = f"📱 Kaspi номер: {KASPI_NUMBER}"
+    if KASPI_NAME:
+        kaspi_line += f" ({KASPI_NAME})"
+
+    await message.answer(
+        f"Ежедневная подписка: <b>{price} ₸</b>\n\n"
+        f"{kaspi_line}\n\n"
+        f"Переведи сумму и пришли сюда скриншот чека (фото) — "
+        f"после подтверждения модератором сможешь принимать заказы сегодня.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(SubscriptionForm.waiting_receipt, F.content_type == ContentType.PHOTO)
+async def subscription_receipt(message: Message, state: FSMContext):
+    driver_id = message.from_user.id
+    driver_row = get_driver_by_telegram_id(driver_id)
+    price = get_subscription_price()
+    file_id = message.photo[-1].file_id
+
+    sub_id = create_subscription_request(driver_id, price, file_id)
+    await state.clear()
+
+    await message.answer(
+        "Чек отправлен на проверку ✅ Как только модератор подтвердит — сможешь принимать заказы.",
+        reply_markup=main_menu_kb(),
+    )
+
+    caption = (
+        f"💳 <b>Оплата подписки</b> (заявка {sub_id})\n\n"
+        f"👤 Водитель: {driver_row['full_name'] if driver_row else message.from_user.full_name}\n"
+        f"📞 Телефон: {driver_row['phone'] if driver_row else '—'}\n"
+        f"💰 Сумма: {price} ₸\n"
+        f"📅 Дата: {today_str()}\n"
+        f"🔗 Telegram: {message.from_user.mention_html()}"
+    )
+    sent = await bot.send_photo(
+        ADMIN_CHAT_ID,
+        file_id,
+        caption=caption,
+        reply_markup=subscription_moderation_kb(sub_id),
+    )
+    set_subscription_admin_message(sub_id, sent.message_id)
+
+
+@router.message(SubscriptionForm.waiting_receipt)
+async def subscription_receipt_wrong(message: Message):
+    await message.answer("Нужен именно скриншот чека (фото). Пришли фото подтверждения оплаты:")
+
+
+@router.callback_query(F.data.startswith("sub_ok:"))
+async def subscription_approve_cb(callback: CallbackQuery):
+    sub_id = int(callback.data.split(":")[1])
+    sub_row = get_subscription(sub_id)
+    if not sub_row:
+        await callback.answer("Заявка не найдена.", show_alert=True)
+        return
+
+    set_subscription_status(sub_id, "confirmed")
+    await callback.message.edit_caption(
+        caption=callback.message.caption + "\n\n✅ <b>ОПЛАТА ПОДТВЕРЖДЕНА</b>",
+        reply_markup=None,
+    )
+    await callback.answer("Подписка подтверждена")
+
+    try:
+        await bot.send_message(
+            sub_row["driver_id"],
+            "Оплата подтверждена ✅ Ты на линии сегодня — лови заказы в группе!",
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить водителя {sub_row['driver_id']}: {e}")
+
+
+@router.callback_query(F.data.startswith("sub_no:"))
+async def subscription_reject_cb(callback: CallbackQuery):
+    sub_id = int(callback.data.split(":")[1])
+    sub_row = get_subscription(sub_id)
+    if not sub_row:
+        await callback.answer("Заявка не найдена.", show_alert=True)
+        return
+
+    set_subscription_status(sub_id, "rejected")
+    await callback.message.edit_caption(
+        caption=callback.message.caption + "\n\n❌ <b>ОТКЛОНЕНО</b>",
+        reply_markup=None,
+    )
+    await callback.answer("Заявка отклонена")
+
+    try:
+        await bot.send_message(
+            sub_row["driver_id"],
+            "Оплата подписки не подтверждена. Проверь перевод и попробуй снова "
+            "через «🟢 Выйти на линию».",
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить водителя {sub_row['driver_id']}: {e}")
+
+
+# ---------- УПРАВЛЕНИЕ ЦЕНОЙ ПОДПИСКИ (только для админа) ----------
+
+@router.message(Command("price"))
+async def cmd_price(message: Message):
+    price = get_subscription_price()
+    await message.answer(f"Текущая цена подписки: <b>{price} ₸</b> в день.")
+
+
+@router.message(Command("set_price"))
+async def cmd_set_price(message: Message):
+    if message.from_user.id not in ADMIN_USER_IDS:
+        await message.answer("Эта команда доступна только организатору.")
+        return
+
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Использование: <code>/set_price 300</code>")
+        return
+
+    new_price = int(parts[1])
+    if new_price < 0 or new_price > 100000:
+        await message.answer("Укажи разумную сумму в тенге, например от 100 до 5000.")
+        return
+
+    set_setting("subscription_price", new_price)
+    await message.answer(f"Цена подписки обновлена: {new_price} ₸ в день.")
+
+
 # ---------- ВОДИТЕЛЬСКИЙ FLOW (группа) ----------
 
 @router.callback_query(F.data.startswith("take:"))
@@ -581,6 +841,14 @@ async def take_order_cb(callback: CallbackQuery):
         await callback.answer(
             "Ты ещё не зарегистрирован как проверенный водитель. "
             "Напиши боту в личку и пройди регистрацию.",
+            show_alert=True,
+        )
+        return
+
+    if not is_driver_online_today(driver.id):
+        await callback.answer(
+            "Сегодня подписка ещё не оплачена. Напиши боту в личку и нажми "
+            "«🟢 Выйти на линию», чтобы принимать заказы.",
             show_alert=True,
         )
         return
