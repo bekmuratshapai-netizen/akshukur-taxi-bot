@@ -1,7 +1,9 @@
 import asyncio
 import logging
 import os
+import re
 import sqlite3
+import urllib.parse
 from datetime import datetime, date
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -269,6 +271,17 @@ def get_order(order_id):
     return row
 
 
+def get_active_taken_order_for_client(client_id):
+    """Последний заказ клиента, который уже взят водителем (для пересылки геолокации)."""
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM orders WHERE client_id=? AND status='taken' ORDER BY id DESC LIMIT 1",
+        (client_id,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
 def take_order_atomic(order_id, driver_id, driver_name):
     """Атомарно назначает заказ водителю, только если он ещё свободен.
     Возвращает True, если именно этот водитель успел забрать заказ."""
@@ -383,6 +396,53 @@ def subscription_moderation_kb(sub_id: int):
             InlineKeyboardButton(text="✅ Подтвердить оплату", callback_data=f"sub_ok:{sub_id}"),
             InlineKeyboardButton(text="❌ Отклонить", callback_data=f"sub_no:{sub_id}"),
         ]]
+    )
+
+
+def build_tel_link(phone: str) -> str:
+    """Приводит номер к формату tel: ссылки."""
+    digits = re.sub(r"[^\d+]", "", phone or "")
+    if not digits:
+        return "tel:"
+    if digits.startswith("+"):
+        return f"tel:{digits}"
+    if digits.startswith("8") and len(digits) == 11:
+        digits = "+7" + digits[1:]
+    elif digits.startswith("7") and len(digits) == 11:
+        digits = "+" + digits
+    else:
+        digits = "+" + digits
+    return f"tel:{digits}"
+
+
+def build_map_link(address: str) -> str:
+    """Открывает 2ГИС с поиском по текстовому адресу (самая популярная карта в Казахстане)."""
+    query = urllib.parse.quote(address or "")
+    return f"https://2gis.kz/search/{query}"
+
+
+def driver_order_actions_kb(order_id: int, client_id: int, phone: str):
+    buttons = [
+        [InlineKeyboardButton(text="💬 Написать пассажиру", url=f"tg://user?id={client_id}")],
+        [InlineKeyboardButton(text="📞 Позвонить пассажиру", url=build_tel_link(phone))],
+        [InlineKeyboardButton(text="📍 Запросить геолокацию", callback_data=f"reqloc:{order_id}")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def client_order_actions_kb(driver_id: int, phone: str):
+    buttons = [
+        [InlineKeyboardButton(text="💬 Написать водителю", url=f"tg://user?id={driver_id}")],
+        [InlineKeyboardButton(text="📞 Позвонить водителю", url=build_tel_link(phone))],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def share_location_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📍 Поделиться геолокацией", request_location=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
     )
 
 
@@ -886,6 +946,8 @@ async def take_order_cb(callback: CallbackQuery):
         return
 
     order = get_order(order_id)
+    driver_row = get_driver_by_telegram_id(driver.id)
+    driver_phone = driver_row["phone"] if driver_row else ""
 
     # обновляем сообщение в группе — убираем кнопку, показываем кто взял
     new_text = (
@@ -896,17 +958,81 @@ async def take_order_cb(callback: CallbackQuery):
         f"👤 Клиент: {order['client_name']}"
     )
     await callback.message.edit_text(new_text)
-    await callback.answer("Заказ за тобой! Контакты клиента выше.")
+    await callback.answer("Заказ за тобой! Проверь личку — там кнопки для связи.")
 
-    # уведомляем клиента
+    # отправляем водителю в личку карточку заказа с кнопками связи
+    try:
+        await bot.send_message(
+            driver.id,
+            f"🚖 <b>Заказ №{order_id}</b> у тебя!\n\n"
+            f"📍 Откуда: {order['pickup']}\n"
+            f"🏁 Куда: {order['destination']}\n"
+            f"👤 Клиент: {order['client_name']}\n"
+            f"📞 {order['phone']}",
+            reply_markup=driver_order_actions_kb(order_id, order["client_id"], order["phone"]),
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось отправить карточку заказа водителю {driver.id}: {e}")
+
+    # уведомляем клиента и даём кнопки связи с водителем
     try:
         await bot.send_message(
             order["client_id"],
             f"Твой заказ №{order_id} принял водитель {driver_name} 🚖\n"
-            f"Он скоро свяжется с тобой по номеру {order['phone']}.",
+            f"📞 {driver_phone or 'номер уточняется'}",
+            reply_markup=client_order_actions_kb(driver.id, driver_phone),
+        )
+        # отдельным сообщением — кнопка отправки геолокации (Telegram не позволяет
+        # совместить её с кнопками-ссылками в одном сообщении)
+        await bot.send_message(
+            order["client_id"],
+            "Если удобно — поделись геолокацией, чтобы водителю было проще тебя найти:",
+            reply_markup=share_location_kb(),
         )
     except Exception as e:
         logging.warning(f"Не удалось уведомить клиента {order['client_id']}: {e}")
+
+
+@router.callback_query(F.data.startswith("reqloc:"))
+async def request_location_cb(callback: CallbackQuery):
+    order_id = int(callback.data.split(":")[1])
+    order = get_order(order_id)
+    if not order:
+        await callback.answer("Заказ не найден.", show_alert=True)
+        return
+
+    try:
+        await bot.send_message(
+            order["client_id"],
+            "Водитель просит поделиться геолокацией, чтобы быстрее тебя найти:",
+            reply_markup=share_location_kb(),
+        )
+        await callback.answer("Запрос отправлен пассажиру")
+    except Exception as e:
+        logging.warning(f"Не удалось запросить геолокацию у клиента {order['client_id']}: {e}")
+        await callback.answer("Не получилось отправить запрос пассажиру.", show_alert=True)
+
+
+@router.message(F.content_type == ContentType.LOCATION)
+async def handle_client_location(message: Message):
+    order = get_active_taken_order_for_client(message.from_user.id)
+    if not order or not order["driver_id"]:
+        # геолокация вне контекста активного заказа — просто игнорируем молча
+        return
+
+    await message.answer("Геолокация отправлена водителю 📍", reply_markup=main_menu_kb())
+    try:
+        await bot.send_location(
+            order["driver_id"],
+            latitude=message.location.latitude,
+            longitude=message.location.longitude,
+        )
+        await bot.send_message(
+            order["driver_id"],
+            f"📍 Пассажир по заказу №{order['id']} прислал геолокацию (см. выше).",
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось переслать геолокацию водителю {order['driver_id']}: {e}")
 
 
 # ---------- СЛУЖЕБНЫЕ КОМАНДЫ ----------
