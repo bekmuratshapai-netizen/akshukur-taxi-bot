@@ -421,19 +421,17 @@ def build_map_link(address: str) -> str:
     return f"https://2gis.kz/search/{query}"
 
 
-def driver_order_actions_kb(order_id: int, client_id: int, phone: str):
+def driver_order_actions_kb(order_id: int, client_id: int):
     buttons = [
         [InlineKeyboardButton(text="💬 Написать пассажиру", url=f"tg://user?id={client_id}")],
-        [InlineKeyboardButton(text="📞 Позвонить пассажиру", url=build_tel_link(phone))],
         [InlineKeyboardButton(text="📍 Запросить геолокацию", callback_data=f"reqloc:{order_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def client_order_actions_kb(driver_id: int, phone: str):
+def client_order_actions_kb(driver_id: int):
     buttons = [
         [InlineKeyboardButton(text="💬 Написать водителю", url=f"tg://user?id={driver_id}")],
-        [InlineKeyboardButton(text="📞 Позвонить водителю", url=build_tel_link(phone))],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -968,8 +966,8 @@ async def take_order_cb(callback: CallbackQuery):
             f"📍 Откуда: {order['pickup']}\n"
             f"🏁 Куда: {order['destination']}\n"
             f"👤 Клиент: {order['client_name']}\n"
-            f"📞 {order['phone']}",
-            reply_markup=driver_order_actions_kb(order_id, order["client_id"], order["phone"]),
+            f"📞 {order['phone']} (нажми на номер, чтобы позвонить)",
+            reply_markup=driver_order_actions_kb(order_id, order["client_id"]),
         )
     except Exception as e:
         logging.warning(f"Не удалось отправить карточку заказа водителю {driver.id}: {e}")
@@ -979,8 +977,8 @@ async def take_order_cb(callback: CallbackQuery):
         await bot.send_message(
             order["client_id"],
             f"Твой заказ №{order_id} принял водитель {driver_name} 🚖\n"
-            f"📞 {driver_phone or 'номер уточняется'}",
-            reply_markup=client_order_actions_kb(driver.id, driver_phone),
+            f"📞 {driver_phone or 'номер уточняется'} (нажми на номер, чтобы позвонить)",
+            reply_markup=client_order_actions_kb(driver.id),
         )
         # отдельным сообщением — кнопка отправки геолокации (Telegram не позволяет
         # совместить её с кнопками-ссылками в одном сообщении)
